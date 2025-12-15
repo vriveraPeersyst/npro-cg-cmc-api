@@ -12,6 +12,7 @@ const EXCLUDED_ACCOUNTS = [
   "npro-marketing.sputnik-dao.near",
   "npro-liquidity.sputnik-dao.near",
   "npro-team.sputnik-dao.near",
+  "distributor.nearmobile.near",
 ];
 
 const DECIMALS = 24n;
