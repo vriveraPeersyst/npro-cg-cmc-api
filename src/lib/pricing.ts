@@ -1,6 +1,6 @@
 /**
  * Pricing Module
- * Fetches NPRO price data from Ref Finance indexer and CoinGecko
+ * Fetches NPRO price data from Rhea Finance and CoinGecko
  */
 
 // ============================================================================
@@ -8,7 +8,7 @@
 // ============================================================================
 
 const COINGECKO_API_URL = "https://api.coingecko.com/api/v3";
-const REF_FINANCE_API_URL = "https://indexer.ref.finance";
+const RHEA_FINANCE_API_URL = "https://api.rhea.finance";
 
 // NPRO token contract
 const NPRO_TOKEN = "npro.nearmobile.near";
@@ -45,41 +45,46 @@ async function getNearUsdPrice(): Promise<number> {
 }
 
 // ============================================================================
-// NPRO PRICE FROM REF FINANCE INDEXER
+// NPRO PRICE FROM RHEA FINANCE API
 // ============================================================================
 
-// Ref Finance indexer returns prices in this format
-type RefTokenPrices = Record<string, { price: string } | string>;
+// Rhea Finance API returns prices in this format
+interface RheaTokenPrice {
+  price: string;
+  symbol: string;
+  decimal: number;
+}
+
+type RheaTokenPrices = Record<string, RheaTokenPrice>;
 
 /**
- * Fetch NPRO price from Ref Finance indexer
- * The indexer returns USD prices directly for all tokens
- * 
- * Once NPRO is listed/has liquidity, it will appear in this API
+ * Fetch NPRO price from Rhea Finance API
+ * The API returns USD prices directly for all tokens
  */
-async function getNproPriceFromRefFinance(): Promise<{ priceUsd: number; priceNear: number } | null> {
+async function getNproPriceFromRheaFinance(): Promise<{ priceUsd: number; priceNear: number } | null> {
   try {
-    const response = await fetch(`${REF_FINANCE_API_URL}/list-token-price`, {
-      headers: { Accept: "application/json" },
+    const response = await fetch(`${RHEA_FINANCE_API_URL}/list-token-price`, {
+      headers: {
+        "Accept": "*/*",
+        "Content-Type": "application/json; charset=UTF-8",
+        "Referer": "https://app.rhea.finance/",
+      },
     });
 
     if (!response.ok) {
-      throw new Error(`Ref Finance API error: ${response.status}`);
+      throw new Error(`Rhea Finance API error: ${response.status}`);
     }
 
-    const prices = (await response.json()) as RefTokenPrices;
+    const prices = (await response.json()) as RheaTokenPrices;
     
     // Look for NPRO token price
     const nproEntry = prices[NPRO_TOKEN];
     if (!nproEntry) {
-      console.log("NPRO not yet listed on Ref Finance indexer");
+      console.log("NPRO not found on Rhea Finance API");
       return null;
     }
 
-    // Handle both formats: { price: "0.123" } or just "0.123"
-    const nproPriceUsd = typeof nproEntry === "string" 
-      ? parseFloat(nproEntry)
-      : parseFloat(nproEntry.price);
+    const nproPriceUsd = parseFloat(nproEntry.price);
 
     if (isNaN(nproPriceUsd) || nproPriceUsd <= 0) {
       return null;
@@ -87,9 +92,7 @@ async function getNproPriceFromRefFinance(): Promise<{ priceUsd: number; priceNe
 
     // Get NEAR price to calculate NPRO/NEAR ratio
     const wrapNearEntry = prices["wrap.near"];
-    const nearPriceUsd = wrapNearEntry
-      ? (typeof wrapNearEntry === "string" ? parseFloat(wrapNearEntry) : parseFloat(wrapNearEntry.price))
-      : null;
+    const nearPriceUsd = wrapNearEntry ? parseFloat(wrapNearEntry.price) : null;
 
     const priceNear = nearPriceUsd && nearPriceUsd > 0 
       ? nproPriceUsd / nearPriceUsd 
@@ -100,7 +103,7 @@ async function getNproPriceFromRefFinance(): Promise<{ priceUsd: number; priceNe
       priceNear,
     };
   } catch (error) {
-    console.error("Failed to fetch from Ref Finance:", error);
+    console.error("Failed to fetch from Rhea Finance:", error);
     return null;
   }
 }
@@ -117,23 +120,23 @@ export interface PriceData {
 
 /**
  * Get NPRO price data
- * Fetches from Ref Finance indexer (returns null if NPRO not yet listed)
+ * Fetches from Rhea Finance API
  */
 export async function getNproPriceData(): Promise<PriceData> {
-  const [refPrice, nearUsd] = await Promise.all([
-    getNproPriceFromRefFinance(),
+  const [rheaPrice, nearUsd] = await Promise.all([
+    getNproPriceFromRheaFinance(),
     getNearUsdPrice(),
   ]);
 
-  if (refPrice) {
+  if (rheaPrice) {
     return {
-      price_usd: refPrice.priceUsd,
-      price_near: refPrice.priceNear,
+      price_usd: rheaPrice.priceUsd,
+      price_near: rheaPrice.priceNear,
       near_usd: nearUsd,
     };
   }
 
-  // NPRO not yet listed - return null prices but valid NEAR/USD
+  // NPRO not found - return null prices but valid NEAR/USD
   return {
     price_usd: null,
     price_near: null,
