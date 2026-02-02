@@ -1,8 +1,8 @@
 import { NextResponse } from "next/server";
 import { getSuppliesFromChain } from "@/lib/near";
 
-// Revalidate every 60 seconds (ISR)
-export const revalidate = 60;
+// Force dynamic rendering - always fetch fresh data from chain
+export const dynamic = "force-dynamic";
 
 /**
  * GET /api/v1/total-supply
@@ -19,7 +19,8 @@ export async function GET() {
       status: 200,
       headers: {
         "Content-Type": "text/plain",
-        "Cache-Control": "public, s-maxage=60, stale-while-revalidate=300",
+        // Short cache (30s) with minimal stale window (30s) for fresher data
+        "Cache-Control": "public, s-maxage=30, stale-while-revalidate=30",
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Allow-Methods": "GET",
       },

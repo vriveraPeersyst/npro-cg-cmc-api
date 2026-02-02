@@ -3,7 +3,8 @@
  * Fetches on-chain supply data for NPRO token
  */
 
-const NEAR_RPC_URL = "https://rpc.mainnet.near.org";
+import { rpcManager } from "./rpc-manager";
+
 const TOKEN_CONTRACT = "npro.nearmobile.near";
 
 const EXCLUDED_ACCOUNTS = [
@@ -21,7 +22,7 @@ const DECIMALS = 24n;
 const YOCTO_DENOM = 10n ** DECIMALS;
 const MAX_SUPPLY_TOKENS = 10_000_000;
 
-interface RpcResponse<T> {
+interface RpcResponse {
   jsonrpc: string;
   id: string;
   result?: {
@@ -35,8 +36,8 @@ interface RpcResponse<T> {
 }
 
 /**
- * Make a direct JSON-RPC call to NEAR
- * This is more lightweight than using near-api-js for view-only calls
+ * Make a direct JSON-RPC call to NEAR with automatic failover
+ * Uses the RPC manager to handle multiple endpoints
  */
 async function callViewMethod(
   methodName: string,
@@ -44,41 +45,47 @@ async function callViewMethod(
 ): Promise<string> {
   const argsBase64 = Buffer.from(JSON.stringify(args)).toString("base64");
 
-  const response = await fetch(NEAR_RPC_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      jsonrpc: "2.0",
-      id: "dontcare",
-      method: "query",
-      params: {
-        request_type: "call_function",
-        finality: "final",
-        account_id: TOKEN_CONTRACT,
-        method_name: methodName,
-        args_base64: argsBase64,
+  return rpcManager.makeRequest(async (rpcUrl: string) => {
+    const response = await fetch(rpcUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
       },
-    }),
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: "dontcare",
+        method: "query",
+        params: {
+          request_type: "call_function",
+          finality: "final",
+          account_id: TOKEN_CONTRACT,
+          method_name: methodName,
+          args_base64: argsBase64,
+        },
+      }),
+    });
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+    }
+
+    const data = (await response.json()) as RpcResponse;
+
+    if (data.error) {
+      throw new Error(`NEAR RPC error: ${data.error.message}`);
+    }
+
+    if (!data.result?.result) {
+      throw new Error("Invalid response from NEAR RPC");
+    }
+
+    // Decode the result bytes to string
+    const resultBytes = new Uint8Array(data.result.result);
+    const resultString = new TextDecoder().decode(resultBytes);
+
+    // The result is JSON-encoded, so parse it (it's typically a quoted string for supplies)
+    return JSON.parse(resultString);
   });
-
-  const data = (await response.json()) as RpcResponse<unknown>;
-
-  if (data.error) {
-    throw new Error(`NEAR RPC error: ${data.error.message}`);
-  }
-
-  if (!data.result?.result) {
-    throw new Error("Invalid response from NEAR RPC");
-  }
-
-  // Decode the result bytes to string
-  const resultBytes = new Uint8Array(data.result.result);
-  const resultString = new TextDecoder().decode(resultBytes);
-  
-  // The result is JSON-encoded, so parse it (it's typically a quoted string for supplies)
-  return JSON.parse(resultString);
 }
 
 async function getTotalSupplyYocto(): Promise<bigint> {
