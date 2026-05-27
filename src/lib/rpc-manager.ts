@@ -1,248 +1,254 @@
 /**
- * RPC Manager for NEAR blockchain
- * Handles failover between multiple RPC endpoints for reliability
+ * RPC Manager for NEAR blockchain.
+ *
+ * Provides failover across several RPC endpoints: an endpoint is blacklisted after
+ * `maxFailures` consecutive errors (or immediately on a rate-limit), and the manager
+ * rotates to the next available one. When every endpoint is blacklisted the whole set
+ * is reset so the service degrades but never gets permanently stuck.
  */
 
+import { env } from "./env";
+import { logger } from "./logger";
+
+const DEFAULT_RPC_URLS = [
+    "https://rpc.mainnet.near.org",
+    "https://near.lava.build",
+    "https://near.blockpi.network/v1/rpc/public",
+    "https://rpc.shitzuapes.xyz",
+    "https://rpc.fastnear.com",
+];
+
+const MAX_FAILURES = 3;
+const BLACKLIST_DURATION_MS = 5 * 60 * 1000;
+const MAX_RETRIES = 5;
+
 interface RpcEndpoint {
-  url: string;
-  failures: number;
-  lastFailure?: number;
-  isBlacklisted: boolean;
+    url: string;
+    failures: number;
+    lastFailure: number | null;
+    isBlacklisted: boolean;
 }
 
-class RpcManager {
-  private endpoints: RpcEndpoint[] = [];
-  private currentIndex: number = 0;
-  private readonly maxFailures = 3;
-  private readonly blacklistDuration = 5 * 60 * 1000; // 5 minutes
+export interface RpcManagerOptions {
+    /** Endpoint URLs to rotate over. Defaults to `env.nearRpcUrl` (if set) + the built-in list. */
+    urls?: string[];
+    /**
+     * Backoff between retries, in milliseconds. Receives the 0-based attempt index. Injectable so
+     * tests can use a zero backoff instead of waiting on real timers.
+     */
+    backoffMs?: (attempt: number) => number;
+}
 
-  constructor() {
-    this.initializeEndpoints();
-  }
+// Every retry switches to a different endpoint (handleFailure always advances the cursor), so there
+// is no point backing off exponentially against a single node: a short fixed pause is enough to let
+// the next endpoint breathe before we hit it.
+const RETRY_BACKOFF_MS = 200;
 
-  private initializeEndpoints() {
-    // Primary and fallback RPC endpoints for NEAR mainnet
-    const rpcUrls = [
-      process.env.NEAR_RPC_URL || "https://rpc.mainnet.near.org",
-      "https://near.lava.build",
-      "https://rpc.mainnet.near.org",
-      "https://near.blockpi.network/v1/rpc/public",
-      "https://rpc.shitzuapes.xyz",
-      "https://rpc.fastnear.com",
-    ];
+function defaultBackoffMs(): number {
+    return RETRY_BACKOFF_MS;
+}
 
-    // Deduplicate and add endpoints
-    const seen = new Set<string>();
-    rpcUrls.forEach((url) => {
-      const cleanUrl = url.trim();
-      if (cleanUrl && !seen.has(cleanUrl)) {
-        seen.add(cleanUrl);
-        this.endpoints.push({
-          url: cleanUrl,
-          failures: 0,
-          isBlacklisted: false,
-        });
-      }
-    });
-
-    console.log(
-      `RPC Manager initialized with ${this.endpoints.length} endpoints:`,
-      this.endpoints.map((ep) => ep.url)
-    );
-  }
-
-  private clearExpiredBlacklists() {
-    const now = Date.now();
-    this.endpoints.forEach((endpoint) => {
-      if (endpoint.isBlacklisted && endpoint.lastFailure) {
-        if (now - endpoint.lastFailure > this.blacklistDuration) {
-          endpoint.isBlacklisted = false;
-          endpoint.failures = 0;
-          console.log(`Cleared blacklist for ${endpoint.url}`);
-        }
-      }
-    });
-  }
-
-  private resetAllEndpoints() {
-    this.endpoints.forEach((endpoint) => {
-      endpoint.failures = 0;
-      endpoint.isBlacklisted = false;
-      endpoint.lastFailure = undefined;
-    });
-    console.log("Reset all RPC endpoints");
-  }
-
-  private getCurrentEndpoint(): RpcEndpoint | null {
-    this.clearExpiredBlacklists();
-
-    const availableEndpoints = this.endpoints.filter((ep) => !ep.isBlacklisted);
-
-    if (availableEndpoints.length === 0) {
-      console.warn("All RPC endpoints are blacklisted, resetting...");
-      this.resetAllEndpoints();
-      return this.endpoints[0];
+function resolveUrls(urls: string[] | undefined): string[] {
+    if (urls !== undefined) {
+        return urls;
     }
+    // env.nearRpcUrl (when set) takes priority over the built-in list; process.env is never read here.
+    return env.nearRpcUrl !== null ? [env.nearRpcUrl, ...DEFAULT_RPC_URLS] : DEFAULT_RPC_URLS;
+}
 
-    if (this.currentIndex >= availableEndpoints.length) {
-      this.currentIndex = 0;
-    }
+function classifyError(error: unknown): "rate-limit" | "transient" | "other" {
+    const message = error instanceof Error ? error.message : String(error);
+    const code = (error as { code?: number | string } | null)?.code;
+    const status = (error as { status?: number } | null)?.status;
 
-    return availableEndpoints[this.currentIndex];
-  }
-
-  private switchToNextEndpoint() {
-    const availableEndpoints = this.endpoints.filter((ep) => !ep.isBlacklisted);
-    if (availableEndpoints.length > 1) {
-      this.currentIndex = (this.currentIndex + 1) % availableEndpoints.length;
-    }
-    console.log(`Switched to RPC endpoint: ${this.getCurrentEndpoint()?.url}`);
-  }
-
-  private handleFailure(error: unknown): boolean {
-    const currentEndpoint = this.getCurrentEndpoint();
-    if (!currentEndpoint) return false;
-
-    currentEndpoint.failures += 1;
-    currentEndpoint.lastFailure = Date.now();
-
-    const errorMessage =
-      error instanceof Error ? error.message : String(error);
-    const errorCode = (error as { code?: number | string })?.code;
-    const errorStatus = (error as { status?: number })?.status;
-
-    // Rate limiting detection
     const isRateLimit =
-      errorMessage.includes("rate") ||
-      errorMessage.includes("429") ||
-      errorCode === 429 ||
-      errorStatus === 429 ||
-      errorMessage.includes("Too many requests") ||
-      errorMessage.includes("throttle") ||
-      errorMessage.includes("exceeded") ||
-      errorMessage.includes("quota");
-
-    // Connection/network errors
-    const isConnectionError =
-      errorMessage.includes("ECONNRESET") ||
-      errorMessage.includes("ECONNREFUSED") ||
-      errorMessage.includes("ETIMEDOUT") ||
-      errorMessage.includes("ENOTFOUND") ||
-      errorMessage.includes("network") ||
-      errorMessage.includes("timeout") ||
-      errorMessage.includes("Timeout") ||
-      errorMessage.includes("Failed to fetch") ||
-      errorMessage.includes("fetch failed") ||
-      errorCode === "ECONNRESET" ||
-      errorCode === "ECONNREFUSED" ||
-      errorCode === "ETIMEDOUT" ||
-      errorCode === "ENOTFOUND";
-
-    // Server errors
-    const isServerError =
-      errorMessage.includes("500") ||
-      errorMessage.includes("502") ||
-      errorMessage.includes("503") ||
-      errorMessage.includes("504") ||
-      (errorStatus !== undefined && errorStatus >= 500);
-
-    const shouldSwitchImmediately =
-      isRateLimit || isConnectionError || isServerError;
-
-    if (shouldSwitchImmediately) {
-      const reason = isRateLimit
-        ? "Rate limited"
-        : isConnectionError
-          ? "Connection error"
-          : "Server error";
-      console.warn(`${reason} on ${currentEndpoint.url}, switching...`);
-
-      if (isRateLimit || currentEndpoint.failures >= this.maxFailures) {
-        currentEndpoint.isBlacklisted = true;
-        console.warn(
-          `Blacklisted ${currentEndpoint.url} for ${this.blacklistDuration / 1000}s`
-        );
-      }
-
-      this.switchToNextEndpoint();
-      return true;
+        message.includes("rate") ||
+        message.includes("429") ||
+        message.includes("Too many requests") ||
+        message.includes("throttle") ||
+        message.includes("exceeded") ||
+        message.includes("quota") ||
+        code === 429 ||
+        status === 429;
+    if (isRateLimit) {
+        return "rate-limit";
     }
 
-    if (currentEndpoint.failures >= this.maxFailures) {
-      currentEndpoint.isBlacklisted = true;
-      console.warn(
-        `Blacklisted ${currentEndpoint.url} after ${this.maxFailures} failures`
-      );
-      this.switchToNextEndpoint();
-      return true;
+    const isTransient =
+        message.includes("ECONNRESET") ||
+        message.includes("ECONNREFUSED") ||
+        message.includes("ETIMEDOUT") ||
+        message.includes("ENOTFOUND") ||
+        message.includes("network") ||
+        message.includes("timeout") ||
+        message.includes("Timeout") ||
+        message.includes("Failed to fetch") ||
+        message.includes("fetch failed") ||
+        message.includes("500") ||
+        message.includes("502") ||
+        message.includes("503") ||
+        message.includes("504") ||
+        code === "ECONNRESET" ||
+        code === "ECONNREFUSED" ||
+        code === "ETIMEDOUT" ||
+        code === "ENOTFOUND" ||
+        (status !== undefined && status >= 500);
+    if (isTransient) {
+        return "transient";
     }
 
-    console.warn(
-      `RPC failure on ${currentEndpoint.url} (attempt ${currentEndpoint.failures}), switching...`
-    );
-    this.switchToNextEndpoint();
-    return true;
-  }
-
-  async makeRequest<T>(
-    requestFn: (rpcUrl: string) => Promise<T>
-  ): Promise<T> {
-    const maxRetries = Math.min(this.endpoints.length, 5);
-    let lastError: unknown;
-
-    for (let attempt = 0; attempt < maxRetries; attempt++) {
-      const currentEndpoint = this.getCurrentEndpoint();
-      if (!currentEndpoint) {
-        throw new Error("No RPC endpoint available");
-      }
-
-      try {
-        console.log(
-          `RPC request attempt ${attempt + 1} using ${currentEndpoint.url}`
-        );
-        const result = await requestFn(currentEndpoint.url);
-
-        // Success - reset failure count
-        if (currentEndpoint.failures > 0) {
-          currentEndpoint.failures = 0;
-        }
-
-        return result;
-      } catch (error) {
-        console.warn(`RPC request failed on attempt ${attempt + 1}:`, error);
-        lastError = error;
-
-        const switched = this.handleFailure(error);
-
-        if (attempt < maxRetries - 1) {
-          const waitTime = switched
-            ? 200
-            : Math.min(500 * Math.pow(2, attempt), 3000);
-          await new Promise((resolve) => setTimeout(resolve, waitTime));
-        }
-      }
-    }
-
-    console.error(`All ${maxRetries} RPC attempts failed`);
-    throw lastError || new Error("All RPC endpoints failed");
-  }
-
-  getCurrentUrl(): string {
-    return this.getCurrentEndpoint()?.url || "unknown";
-  }
-
-  getStatus() {
-    return {
-      currentUrl: this.getCurrentUrl(),
-      endpoints: this.endpoints.map((ep) => ({
-        url: ep.url,
-        failures: ep.failures,
-        isBlacklisted: ep.isBlacklisted,
-        lastFailure: ep.lastFailure,
-      })),
-    };
-  }
+    return "other";
 }
 
-// Singleton instance
+export class RpcManager {
+    private readonly endpoints: RpcEndpoint[];
+    private readonly backoffMs: (attempt: number) => number;
+    /**
+     * Position into the STABLE `endpoints` array (never a filtered view). Blacklisting an endpoint
+     * does not shift this array, so the cursor can never point past a removed entry or alias a
+     * different endpoint. Rotation skips blacklisted endpoints at read time.
+     */
+    private cursor = 0;
+
+    constructor(options: RpcManagerOptions = {}) {
+        const seen = new Set<string>();
+        this.endpoints = [];
+        for (const url of resolveUrls(options.urls)) {
+            const cleanUrl = url.trim();
+            if (cleanUrl !== "" && !seen.has(cleanUrl)) {
+                seen.add(cleanUrl);
+                this.endpoints.push({ url: cleanUrl, failures: 0, lastFailure: null, isBlacklisted: false });
+            }
+        }
+        this.backoffMs = options.backoffMs ?? defaultBackoffMs;
+
+        logger.debug({ endpointCount: this.endpoints.length }, "rpc manager initialized");
+    }
+
+    async makeRequest<T>(requestFn: (rpcUrl: string) => Promise<T>): Promise<T> {
+        const maxRetries = Math.min(this.endpoints.length, MAX_RETRIES);
+        let lastError: unknown;
+
+        for (let attempt = 0; attempt < maxRetries; attempt++) {
+            const endpoint = this.getCurrentEndpoint();
+            if (endpoint === null) {
+                throw new Error("No RPC endpoint available");
+            }
+
+            try {
+                logger.debug({ attempt: attempt + 1, url: endpoint.url }, "rpc request attempt");
+                const result = await requestFn(endpoint.url);
+                endpoint.failures = 0;
+                return result;
+            } catch (error) {
+                lastError = error;
+                this.handleFailure(endpoint, error);
+
+                if (attempt < maxRetries - 1) {
+                    await delay(this.backoffMs(attempt));
+                }
+            }
+        }
+
+        logger.error({ err: lastError, maxRetries }, "all rpc attempts failed");
+        throw lastError ?? new Error("All RPC endpoints failed");
+    }
+
+    getCurrentUrl(): string {
+        return this.getCurrentEndpoint()?.url ?? "unknown";
+    }
+
+    getStatus(): {
+        currentUrl: string;
+        endpoints: { url: string; failures: number; isBlacklisted: boolean; lastFailure: number | null }[];
+    } {
+        return {
+            currentUrl: this.getCurrentUrl(),
+            endpoints: this.endpoints.map((ep) => ({
+                url: ep.url,
+                failures: ep.failures,
+                isBlacklisted: ep.isBlacklisted,
+                lastFailure: ep.lastFailure,
+            })),
+        };
+    }
+
+    /**
+     * Return the endpoint at the cursor, advancing past blacklisted ones. If every endpoint is
+     * blacklisted, reset them all (degraded but never stuck) and serve the first.
+     */
+    private getCurrentEndpoint(): RpcEndpoint | null {
+        this.clearExpiredBlacklists();
+
+        if (this.endpoints.length === 0) {
+            return null;
+        }
+
+        for (let offset = 0; offset < this.endpoints.length; offset++) {
+            const candidate = this.endpoints[(this.cursor + offset) % this.endpoints.length];
+            if (!candidate.isBlacklisted) {
+                this.cursor = (this.cursor + offset) % this.endpoints.length;
+                return candidate;
+            }
+        }
+
+        logger.warn("all rpc endpoints blacklisted, resetting");
+        this.resetAllEndpoints();
+        this.cursor = 0;
+        return this.endpoints[0];
+    }
+
+    /** Advance the cursor to the next endpoint (read side skips blacklisted ones). */
+    private advanceCursor(): void {
+        this.cursor = (this.cursor + 1) % this.endpoints.length;
+    }
+
+    /** Record a failure, blacklist the endpoint if warranted, and always advance to the next one. */
+    private handleFailure(endpoint: RpcEndpoint, error: unknown): void {
+        endpoint.failures += 1;
+        endpoint.lastFailure = Date.now();
+
+        const kind = classifyError(error);
+
+        if (kind === "rate-limit") {
+            endpoint.isBlacklisted = true;
+            logger.warn({ url: endpoint.url, reason: "rate-limit" }, "blacklisted rpc endpoint");
+        } else if (endpoint.failures >= MAX_FAILURES) {
+            endpoint.isBlacklisted = true;
+            logger.warn({ url: endpoint.url, failures: endpoint.failures, reason: kind }, "blacklisted rpc endpoint");
+        } else {
+            logger.warn({ url: endpoint.url, failures: endpoint.failures, reason: kind }, "rpc failure, switching");
+        }
+
+        this.advanceCursor();
+    }
+
+    private clearExpiredBlacklists(): void {
+        const now = Date.now();
+        for (const endpoint of this.endpoints) {
+            if (endpoint.isBlacklisted && endpoint.lastFailure !== null && now - endpoint.lastFailure > BLACKLIST_DURATION_MS) {
+                endpoint.isBlacklisted = false;
+                endpoint.failures = 0;
+                logger.debug({ url: endpoint.url }, "cleared rpc blacklist");
+            }
+        }
+    }
+
+    private resetAllEndpoints(): void {
+        for (const endpoint of this.endpoints) {
+            endpoint.failures = 0;
+            endpoint.isBlacklisted = false;
+            endpoint.lastFailure = null;
+        }
+    }
+}
+
+function delay(ms: number): Promise<void> {
+    if (ms <= 0) {
+        return Promise.resolve();
+    }
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Process-wide singleton used by the data layer. */
 export const rpcManager = new RpcManager();
